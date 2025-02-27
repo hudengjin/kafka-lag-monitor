@@ -1,0 +1,26 @@
+[package]
+name = "kafka-lag-monitor"
+version = "0.1.0"
+edition = "2024"
+authors = ["hudengjin <hdengjin@gmail.com>"]
+description = "Kafka consumer lag monitoring tool"
+license = "MIT"
+repository = "https://github.com/hudengjin/kafka-lag-monitor"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dependencies]
+config = "0.15.8"
+kafka = { version = "0.10.0", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+rustls = "0.22.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
