@@ -1,74 +1,148 @@
-use kafka::consumer::{Consumer, FetchOffset, GroupOffsetStorage};
-use kafka::error::Error as KafkaError;
+use anyhow::{Context, Result};
+use chrono::Local;
+use config::Config;
+use rdkafka::admin::{AdminClient, AdminOptions, GroupListing};
+use rdkafka::client::DefaultClientContext;
+use rdkafka::config::{FromClientConfig, RDKafkaLogLevel};
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::{ClientConfig, Offset};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
+use tracing::{debug, error, info, instrument};
 
-#[derive(Debug)]
-struct ConsumerGroupLag {
-    group_id: String,
-    topic_lags: HashMap<String, i64>,
+#[derive(Debug, Deserialize)]
+struct AppConfig {
+    kafka: KafkaConfig,
+    logging: LoggingConfig,
 }
 
-async fn get_consumer_groups(brokers: Vec<String>) -> Result<Vec<String>, KafkaError> {
-    let consumer = Consumer::from_hosts(brokers)
-        .with_group("kafka-lag-monitor".to_string())
-        .with_fallback_offset(FetchOffset::Earliest)
-        .create()?;
-    
-    Ok(consumer.groups()?.into_iter().map(|g| g.group_id).collect())
+#[derive(Debug, Deserialize)]
+struct KafkaConfig {
+    brokers: String,
+    monitor_interval_sec: u64,
+    group_id_pattern: String,
+    ssl: SslConfig,
 }
 
-async fn get_group_lag(brokers: Vec<String>, group_id: &str) -> Result<ConsumerGroupLag, KafkaError> {
-    let consumer = Consumer::from_hosts(brokers.clone())
-        .with_group(group_id.to_string())
-        .with_offset_storage(Some(GroupOffsetStorage::Kafka))
-        .with_fallback_offset(FetchOffset::Earliest)
-        .with_socket_timeout(Duration::from_secs(10))
-        .create()?;
+#[derive(Debug, Deserialize)]
+struct SslConfig {
+    enabled: bool,
+    ca_path: String,
+    cert_path: String,
+    key_path: String,
+}
 
-    let mut topic_lags = HashMap::new();
+#[derive(Debug, Deserialize)]
+struct LoggingConfig {
+    level: String,
+    format: String,
+}
+
+#[instrument]
+async fn get_consumer_groups(client: &AdminClient<DefaultClientContext>) -> Result<Vec<GroupListing>> {
+    let groups = client.list_groups(&AdminOptions::new().request_timeout(Some(Duration::from_secs(5))))
+        .await
+        .context("Failed to list consumer groups")?;
+
+    Ok(groups)
+}
+
+#[instrument(skip(consumer))]
+fn get_group_lag(consumer: &BaseConsumer, group_id: &str) -> Result<HashMap<(String, i32), (i64, i64)>> {
+    let mut lag_data = HashMap::new();
     
-    for topic in consumer.topics() {
-        let partitions = consumer.fetch_metadata(&topic, Duration::from_secs(5))?.partitions();
-        let mut total_lag = 0;
+    let group_metadata = consumer.fetch_group_metadata(None, Some(Duration::from_secs(5)))?;
+    for topic_partition in group_metadata.topic_partitions() {
+        let (low, high) = consumer.fetch_watermarks(
+            topic_partition.topic(),
+            topic_partition.partition(),
+            Duration::from_secs(5),
+        )?;
 
-        for partition in partitions {
-            let (low, high) = consumer.fetch_watermarks(&topic, partition.id)?;
-            let offset = consumer.fetch_last_stable_offset(&topic, partition.id)?;
-            total_lag += high - offset;
-        }
+        let offset_map = consumer.committed_offsets(
+            &[topic_partition.clone()],
+            Duration::from_secs(5)
+        )?;
+        let offset = offset_map.get(topic_partition).cloned().unwrap_or(Offset::Invalid);
 
-        if total_lag > 0 {
-            topic_lags.insert(topic.to_string(), total_lag);
+        if let Offset::Offset(offset) = offset {
+            let lag = high - offset;
+            lag_data.insert(
+                (topic_partition.topic().to_string(), topic_partition.partition()),
+                (offset, lag),
+            );
         }
     }
 
-    Ok(ConsumerGroupLag {
-        group_id: group_id.to_string(),
-        topic_lags,
-    })
+    Ok(lag_data)
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let brokers = vec!["localhost:9092".to_string()];
-    
-    let groups = get_consumer_groups(brokers.clone()).await?;
-    let mut all_lags = Vec::new();
+async fn main() -> Result<()> {
+    let settings = Config::builder()
+        .add_source(config::File::with_name("config"))
+        .build()?
+        .try_deserialize::<AppConfig>()?;
 
-    for group in groups {
-        match get_group_lag(brokers.clone(), &group).await {
-            Ok(lag) => all_lags.push(lag),
-            Err(e) => eprintln!("Error getting lag for group {}: {}", group, e),
-        }
+    // 初始化日志
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(match settings.logging.level.as_str() {
+            "debug" => tracing::Level::DEBUG,
+            "warn" => tracing::Level::WARN,
+            "error" => tracing::Level::ERROR,
+            _ => tracing::Level::INFO,
+        })
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    // 配置Kafka客户端
+    let mut client_config = ClientConfig::new();
+    client_config
+        .set("bootstrap.servers", &settings.kafka.brokers)
+        .set_log_level(RDKafkaLogLevel::Debug);
+
+    if settings.kafka.ssl.enabled {
+        client_config
+            .set("security.protocol", "ssl")
+            .set("ssl.ca.location", &settings.kafka.ssl.ca_path)
+            .set("ssl.certificate.location", &settings.kafka.ssl.cert_path)
+            .set("ssl.key.location", &settings.kafka.ssl.key_path);
     }
 
-    for lag in all_lags {
-        println!("Consumer Group: {}", lag.group_id);
-        for (topic, lag) in &lag.topic_lags {
-            println!("  Topic: {}, Lag: {}", topic, lag);
-        }
-    }
+    let admin_client: AdminClient<_> = client_config.create()?;
+    let consumer: BaseConsumer = client_config.create()?;
 
-    Ok(())
+    loop {
+        info!("Starting consumer lag check at {}", Local::now());
+        
+        match get_consumer_groups(&admin_client).await {
+            Ok(groups) => {
+                let group_filter = regex::Regex::new(&settings.kafka.group_id_pattern)
+                    .context("Invalid group_id_pattern regex")?;
+                
+                for group in groups.into_iter().filter(|g| group_filter.is_match(&g.group_id)) {
+                    match get_group_lag(&consumer, &group.group_id) {
+                        Ok(lags) => {
+                            for ((topic, partition), (offset, lag)) in lags {
+                                info!(
+                                    group = group.group_id,
+                                    topic = topic,
+                                    partition = partition,
+                                    current_offset = offset,
+                                    lag = lag,
+                                    "Consumer group lag"
+                                );
+                            }
+                        }
+                        Err(e) => error!(error = %e, "Failed to get lag for group {}", group.group_id),
+                    }
+                }
+            }
+            Err(e) => error!(error = %e, "Failed to fetch consumer groups"),
+        }
+
+        tokio::time::sleep(Duration::from_secs(settings.kafka.monitor_interval_sec)).await;
+    }
 }

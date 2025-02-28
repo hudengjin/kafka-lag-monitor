@@ -1,9 +1,13 @@
 kafka:
   brokers: "localhost:9092"
-  topics:
-    - topic1
-    - topic2
-  consumer_groups:
-    - group1
-    - group2
-  poll_interval_secs: 5
+  monitor_interval_sec: 60
+  group_id_pattern: ".*"  # 正则表达式匹配所有消费者组
+  ssl:
+    enabled: false
+    ca_path: ""
+    cert_path: ""
+    key_path: ""
+
+logging:
+  level: "info"
+  format: "json"
